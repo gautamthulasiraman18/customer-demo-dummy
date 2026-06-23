@@ -1,0 +1,37 @@
+name: VGTSec Security Scan after Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  notify-vgtsec:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for Railway to deploy
+        run: sleep 90
+
+      - name: Check app is healthy
+        run: |
+          for i in {1..10}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              https://web-production-b13da.up.railway.app/health)
+            echo "Attempt $i: HTTP $STATUS"
+            if [ "$STATUS" = "200" ]; then
+              echo "App is healthy"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "App did not become healthy in time"
+          exit 1
+
+      - name: Notify VGTSec Scanner
+        run: |
+          PAYLOAD='{"ref":"refs/heads/main","repository":{"full_name":"gautamthulasiraman18/customer-demo-dummy"},"commits":[{"id":"${{ github.sha }}"}]}'
+          SECRET="${{ secrets.VGTSEC_WEBHOOK_SECRET }}"
+          SIG="sha256=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $2}')"
+          curl -s -X POST https://national-designate-clumsily.ngrok-free.dev/webhook \
+            -H "Content-Type: application/json" \
+            -H "X-Hub-Signature-256: $SIG" \
+            -d "$PAYLOAD"
