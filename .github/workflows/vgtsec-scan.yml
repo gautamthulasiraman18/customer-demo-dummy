@@ -5,33 +5,84 @@ on:
     branches: [main]
 
 jobs:
-  notify-vgtsec:
+  security-scan:
     runs-on: ubuntu-latest
     steps:
       - name: Wait for Railway to deploy
         run: sleep 90
 
-      - name: Check app is healthy
+      - name: Check Railway app is healthy
         run: |
           for i in {1..10}; do
             STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
               https://web-production-b13da.up.railway.app/health)
             echo "Attempt $i: HTTP $STATUS"
             if [ "$STATUS" = "200" ]; then
-              echo "App is healthy"
+              echo "✅ App is healthy"
               exit 0
             fi
             sleep 15
           done
-          echo "App did not become healthy in time"
+          echo "❌ App did not become healthy"
           exit 1
 
-      - name: Notify VGTSec Scanner
+      - name: Login to VGTSec
+        id: login
         run: |
-          PAYLOAD='{"ref":"refs/heads/main","repository":{"full_name":"gautamthulasiraman18/customer-demo-dummy"},"commits":[{"id":"${{ github.sha }}"}]}'
-          SECRET="${{ secrets.VGTSEC_WEBHOOK_SECRET }}"
-          SIG="sha256=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $2}')"
-          curl -s -X POST https://national-designate-clumsily.ngrok-free.dev/webhook \
+          TOKEN=$(curl -s -X POST ${{ secrets.VGTSEC_URL }}/api/auth/login \
             -H "Content-Type: application/json" \
-            -H "X-Hub-Signature-256: $SIG" \
-            -d "$PAYLOAD"
+            -H "x-api-key: ${{ secrets.VGTSEC_PTA_KEY }}" \
+            -d '{"username":"${{ secrets.VGTSEC_USERNAME }}","password":"${{ secrets.VGTSEC_PASSWORD }}"}' \
+            | python3 -c "import json,sys; print(json.load(sys.stdin)['access_token'])")
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+          echo "✅ Logged in to VGTSec"
+
+      - name: Start Security Scan
+        id: scan
+        run: |
+          MISSION=$(curl -s -X POST ${{ secrets.VGTSEC_URL }}/api/scan/start \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ steps.login.outputs.token }}" \
+            -H "x-api-key: ${{ secrets.VGTSEC_PTA_KEY }}" \
+            -d '{
+              "targetUrl": "https://web-production-b13da.up.railway.app",
+              "scanType": "active_passive_only",
+              "directScanMode": false
+            }' | python3 -c "import json,sys; print(json.load(sys.stdin)['mission_id'])")
+          echo "mission_id=$MISSION" >> $GITHUB_OUTPUT
+          echo "✅ Scan started — mission: $MISSION"
+
+      - name: Poll Scan Status
+        run: |
+          MISSION="${{ steps.scan.outputs.mission_id }}"
+          for i in {1..60}; do
+            RESPONSE=$(curl -s \
+              -H "Authorization: Bearer ${{ steps.login.outputs.token }}" \
+              -H "x-api-key: ${{ secrets.VGTSEC_PTA_KEY }}" \
+              ${{ secrets.VGTSEC_URL }}/api/scan/$MISSION/status)
+            STATUS=$(echo $RESPONSE | python3 -c "import json,sys; print(json.load(sys.stdin).get('status','unknown'))")
+            PERCENT=$(echo $RESPONSE | python3 -c "import json,sys; print(json.load(sys.stdin).get('percent',0))")
+            echo "Status: $STATUS | Progress: $PERCENT%"
+            if [ "$STATUS" = "completed" ] || [ "$STATUS" = "failed" ] || [ "$STATUS" = "cancelled" ]; then
+              echo "✅ Scan finished: $STATUS"
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "⚠ Scan timed out"
+
+      - name: Fetch Findings
+        run: |
+          MISSION="${{ steps.scan.outputs.mission_id }}"
+          curl -s \
+            -H "Authorization: Bearer ${{ steps.login.outputs.token }}" \
+            -H "x-api-key: ${{ secrets.VGTSEC_PTA_KEY }}" \
+            ${{ secrets.VGTSEC_URL }}/api/scan/$MISSION/findings \
+            | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          findings = data if isinstance(data, list) else data.get('findings', [])
+          print(f'Total findings: {len(findings)}')
+          for f in findings[:5]:
+              print(f'  [{f.get(\"severity\",\"?\")}] {f.get(\"name\",\"?\")}: {f.get(\"url\",\"?\")}')
+          "
